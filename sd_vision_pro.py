@@ -1,41 +1,57 @@
 #!/usr/bin/env python3
 """
 SD Vision Pro - Stable Diffusion用 画像解析・プロンプト生成ツール
+※ Google Gemini API使用（完全無料・クレジットカード不要）
 
-画像をClaude Vision APIで解析し、SDでそのまま使えるプロンプトを自動生成します。
+◆ 必要なライブラリのインストール:
+    pip install google-generativeai Pillow pyperclip
 
-必要なライブラリのインストール:
-    pip install anthropic Pillow pyperclip
+◆ APIキーの取得（無料・クレジットカード不要）:
+    1. https://aistudio.google.com/ にアクセス（Googleアカウントでログイン）
+    2. 「Get API key」→「Create API key」でキーを生成
+    3. 下記コマンドで環境変数に設定:
+       Mac/Linux: export GOOGLE_API_KEY="AIza..."
+       Windows:   set GOOGLE_API_KEY=AIza...
 
-使い方:
+◆ 使い方:
     python sd_vision_pro.py image.png
-    python sd_vision_pro.py photo.jpg --model sdxl
-    python sd_vision_pro.py illustration.png --model pony
+    python sd_vision_pro.py photo.jpg --model realistic
+    python sd_vision_pro.py anime.png --model pony
     python sd_vision_pro.py image.png --no-clipboard
 """
 
 import argparse
-import base64
 import sys
 from pathlib import Path
 
+# ============================================================
+# ライブラリの読み込み（未インストール時は分かりやすいメッセージを表示）
+# ============================================================
+
 try:
-    import anthropic
+    import google.generativeai as genai
 except ImportError:
-    print("Error: anthropic ライブラリが必要です。")
-    print("  pip install anthropic")
+    print("=" * 60)
+    print("Error: google-generativeai が必要です。")
+    print()
+    print("以下のコマンドでインストールしてください:")
+    print("  pip install google-generativeai")
+    print("=" * 60)
     sys.exit(1)
 
 try:
     from PIL import Image
 except ImportError:
-    print("Error: Pillow ライブラリが必要です。")
+    print("=" * 60)
+    print("Error: Pillow が必要です。")
+    print()
+    print("以下のコマンドでインストールしてください:")
     print("  pip install Pillow")
+    print("=" * 60)
     sys.exit(1)
 
 try:
     import pyperclip
-
     CLIPBOARD_AVAILABLE = True
 except ImportError:
     CLIPBOARD_AVAILABLE = False
@@ -45,7 +61,9 @@ except ImportError:
 # 定数
 # ============================================================
 
-QUALITY_PREFIX = "(best quality:1.2), masterpiece, highres"
+QUALITY_PREFIX_DEFAULT = "(best quality:1.2), masterpiece, highres"
+
+QUALITY_PREFIX_PONY = "score_9, score_8_up, score_7_up, score_6_up"
 
 NEGATIVE_PROMPT_ANIME = (
     "lowres, bad anatomy, bad hands, text, error, missing fingers, "
@@ -65,65 +83,57 @@ NEGATIVE_PROMPT_REALISTIC = (
     "over-saturated, over-exposed, under-exposed"
 )
 
-MODEL_NEGATIVE_OVERRIDES = {
-    "pony": (
-        "score_1, score_2, score_3, score_4, score_5, "
-        "lowres, bad anatomy, bad hands, text, error, "
-        "missing fingers, extra digit, fewer digits, "
-        "cropped, worst quality, low quality, normal quality, "
-        "jpeg artifacts, signature, watermark, username, blurry, "
-        "deformed, disfigured, mutation, ugly"
-    ),
-}
+NEGATIVE_PROMPT_PONY = (
+    "score_1, score_2, score_3, score_4, score_5, "
+    "lowres, bad anatomy, bad hands, text, error, "
+    "missing fingers, extra digit, fewer digits, "
+    "cropped, worst quality, low quality, normal quality, "
+    "jpeg artifacts, signature, watermark, username, blurry, "
+    "deformed, disfigured, mutation, ugly"
+)
 
-VISION_SYSTEM_PROMPT = """\
-You are an expert Stable Diffusion prompt engineer with deep knowledge of \
-image composition, art styles, and SD tag conventions.
+# Geminiへの指示プロンプト
+ANALYSIS_PROMPT = """\
+You are a Stable Diffusion prompt expert. Analyze this image and generate \
+a precise SD prompt in comma-separated English tag format.
 
-Your task: Analyze the provided image and generate a precise, \
-comma-separated English tag prompt that can reproduce it in Stable Diffusion.
+## Output format (strictly follow this):
+Line 1: STYLE: anime   (or)   STYLE: realistic
+Line 2: (blank)
+Line 3: the complete comma-separated tag prompt
 
-## Rules
+## Style detection:
+- "anime": anime, illustration, cartoon, manga, digital art, drawing
+- "realistic": photograph, photorealistic, real person, 3D render
 
-1. **Style Detection**: First determine if the image is:
-   - "anime" (anime, illustration, cartoon, manga, digital art)
-   - "realistic" (photograph, photorealistic render, real person)
-   Output this as the first line: `STYLE: anime` or `STYLE: realistic`
+## Tags to extract (in this order):
+1. Subject: gender/count (1girl, 1boy, solo, couple, etc.)
+2. Hair: length + style + color (long hair, blonde hair, ponytail, etc.)
+3. Eyes: color + style (blue eyes, sparkling eyes, etc.)
+4. Expression: emotion (smile, blush, expressionless, etc.)
+5. Body: build (slender, petite, curvy, muscular, etc.)
+6. Clothing: full description (school uniform, white shirt, pleated skirt, etc.)
+7. Accessories: (glasses, choker, hair ribbon, etc.)
+8. Pose: body position (standing, sitting, arms crossed, etc.)
+9. Composition: framing (upper body, full body, close-up, from above, etc.)
+10. Background: setting (classroom, cherry blossoms, night city, etc.)
+11. Lighting: type (soft lighting, golden hour, rim lighting, etc.)
+12. Effects/atmosphere: (bokeh, depth of field, particles, etc.)
+13. Art style specifics:
+    - anime: (cel shading, vibrant colors, clean lines, etc.)
+    - realistic: (shallow depth of field, 85mm lens, film grain, etc.)
 
-2. **Tag Extraction**: Extract ALL relevant details as SD-compatible tags:
-   - **Subject**: gender, number of people, age impression (1girl, 1boy, solo, etc.)
-   - **Hair**: style, length, color (e.g., long hair, blonde hair, ponytail)
-   - **Eyes**: color, shape (e.g., blue eyes, detailed eyes)
-   - **Face/Expression**: emotion, details (e.g., smile, blush, looking at viewer)
-   - **Body**: type, notable features (e.g., slender, petite)
-   - **Clothing**: full outfit description (e.g., school uniform, white shirt, pleated skirt)
-   - **Accessories**: jewelry, headwear, etc. (e.g., hair ribbon, glasses, choker)
-   - **Pose**: body position, hand placement (e.g., standing, hand on hip, peace sign)
-   - **Composition**: camera angle, framing (e.g., upper body, from above, close-up)
-   - **Background**: setting, environment (e.g., classroom, cherry blossoms, night city)
-   - **Lighting**: type, direction (e.g., soft lighting, backlighting, golden hour)
-   - **Effects**: particles, atmosphere (e.g., bokeh, sparkles, lens flare)
-   - **Art style specifics**: if anime, note the style cues (e.g., cel shading, vibrant colors)
-   - **Photo specifics**: if realistic, note camera cues (e.g., shallow depth of field, 85mm lens, film grain)
+## Weighting rules (use sparingly, only for defining features):
+- Most prominent feature: (tag:1.3)
+- Clearly visible: (tag:1.2)
+- Notable: (tag:1.1)
+- Normal: no weight
 
-3. **Weighting**: Apply (tag:weight) for especially prominent features:
-   - Very prominent / defining features: (tag:1.3)
-   - Clearly visible important features: (tag:1.2)
-   - Notable features: (tag:1.1)
-   - Standard features: no weight needed
-
-4. **Output Format**:
-   Line 1: `STYLE: anime` or `STYLE: realistic`
-   Line 2: Empty line
-   Line 3: The complete comma-separated tag prompt (NO quality prefix, I will add that)
-
-   Output ONLY these 3 lines. No explanations, no markdown, no extra text.
-
-5. **Quality Guidelines**:
-   - Use established SD/Danbooru tag conventions
-   - Be specific: prefer "pleated skirt" over "skirt"
-   - Include 20-50 tags for thorough coverage
-   - Order: subject → appearance → clothing → pose → composition → background → lighting → effects
+## Important:
+- Use established SD/Danbooru tag conventions
+- Be specific: "pleated skirt" not "skirt", "long wavy hair" not "hair"
+- Include 20-45 tags total
+- Output ONLY the 3 lines above. No explanation, no markdown.
 """
 
 
@@ -131,143 +141,149 @@ comma-separated English tag prompt that can reproduce it in Stable Diffusion.
 # 画像読み込み
 # ============================================================
 
+SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
-def load_image_as_base64(image_path: str) -> tuple[str, str]:
-    """画像ファイルを読み込み、Base64エンコードとメディアタイプを返す。"""
+
+def load_image(image_path: str) -> Image.Image:
+    """画像ファイルを読み込んでPIL Imageを返す。"""
     path = Path(image_path)
+
     if not path.exists():
-        print(f"Error: ファイルが見つかりません: {image_path}")
+        print(f"Error: ファイルが見つかりません → {image_path}")
         sys.exit(1)
 
-    # Pillowで画像を検証
+    if path.suffix.lower() not in SUPPORTED_FORMATS:
+        print(f"Error: 非対応の画像形式です → {path.suffix}")
+        print(f"  対応形式: {', '.join(sorted(SUPPORTED_FORMATS)).upper()}")
+        sys.exit(1)
+
     try:
         img = Image.open(path)
-        img.verify()
+        img.load()  # 完全に読み込んで破損チェック
+        return img
     except Exception as e:
-        print(f"Error: 画像ファイルの読み込みに失敗しました: {e}")
+        print(f"Error: 画像の読み込みに失敗しました → {e}")
         sys.exit(1)
-
-    # メディアタイプを決定
-    suffix = path.suffix.lower()
-    media_type_map = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
-    media_type = media_type_map.get(suffix)
-    if not media_type:
-        print(f"Error: サポートされていない画像形式です: {suffix}")
-        print("  対応形式: PNG, JPG, JPEG, GIF, WEBP")
-        sys.exit(1)
-
-    # Base64エンコード
-    with open(path, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-
-    return image_data, media_type
 
 
 # ============================================================
-# Claude Vision API 呼び出し
+# Gemini APIで画像を解析
 # ============================================================
 
+def setup_gemini() -> None:
+    """Gemini APIキーを設定する。"""
+    import os
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        print("=" * 60)
+        print("Error: GOOGLE_API_KEY が設定されていません。")
+        print()
+        print("【無料APIキーの取得手順】")
+        print("  1. https://aistudio.google.com/ にアクセス")
+        print("     （Googleアカウントでログイン、クレジットカード不要）")
+        print("  2. 「Get API key」→「Create API key」")
+        print("  3. キーをコピーして以下を実行:")
+        print()
+        print("  Mac/Linux:")
+        print('    export GOOGLE_API_KEY="AIza..."')
+        print()
+        print("  Windows:")
+        print("    set GOOGLE_API_KEY=AIza...")
+        print("=" * 60)
+        sys.exit(1)
+    genai.configure(api_key=api_key)
 
-def analyze_image(image_data: str, media_type: str) -> tuple[str, str]:
-    """Claude Vision APIで画像を解析し、(style, prompt)のタプルを返す。"""
-    client = anthropic.Anthropic()
+
+def analyze_image(img: Image.Image) -> tuple[str, str]:
+    """Geminiで画像を解析し (style, raw_tags) を返す。"""
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
     print("🔍 画像を解析中...")
     print()
 
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2048,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_data,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": "Analyze this image and generate a Stable Diffusion prompt following the rules in your system prompt.",
-                    },
-                ],
-            }
-        ],
-        system=VISION_SYSTEM_PROMPT,
-    )
+    try:
+        response = model.generate_content([ANALYSIS_PROMPT, img])
+    except Exception as e:
+        error_msg = str(e)
+        if "API_KEY_INVALID" in error_msg or "API key not valid" in error_msg:
+            print("Error: APIキーが無効です。Google AI Studioで確認してください。")
+            print("  https://aistudio.google.com/")
+        elif "QUOTA_EXCEEDED" in error_msg or "quota" in error_msg.lower():
+            print("Error: 無料枠の上限に達しました。")
+            print("  1日1,500回 / 1分15回が上限です。少し待ってから再試行してください。")
+        elif "SAFETY" in error_msg:
+            print("Error: この画像はGeminiの安全フィルターによりブロックされました。")
+        else:
+            print(f"Error: APIリクエストに失敗しました → {e}")
+        sys.exit(1)
 
-    response_text = message.content[0].text.strip()
+    response_text = response.text.strip()
 
     # レスポンスをパース
     lines = [line.strip() for line in response_text.split("\n") if line.strip()]
 
-    style = "anime"  # デフォルト
-    prompt_tags = ""
+    style = "anime"
+    raw_tags = ""
 
     for line in lines:
         if line.upper().startswith("STYLE:"):
-            style_value = line.split(":", 1)[1].strip().lower()
-            if "realistic" in style_value or "photo" in style_value:
-                style = "realistic"
-            else:
-                style = "anime"
-        elif not line.upper().startswith("STYLE:"):
-            # STYLE行以外で最も長い行をプロンプトとみなす
-            if len(line) > len(prompt_tags):
-                prompt_tags = line
+            value = line.split(":", 1)[1].strip().lower()
+            style = "realistic" if ("realistic" in value or "photo" in value) else "anime"
+        elif len(line) > len(raw_tags) and not line.upper().startswith("STYLE:"):
+            raw_tags = line
 
-    return style, prompt_tags
+    if not raw_tags:
+        # フォールバック: 全行を結合
+        raw_tags = ", ".join(
+            line for line in lines if not line.upper().startswith("STYLE:")
+        )
+
+    return style, raw_tags
 
 
 # ============================================================
 # プロンプト構築
 # ============================================================
 
-
-def build_full_prompt(style: str, raw_tags: str, model: str) -> tuple[str, str]:
+def build_prompt(style: str, raw_tags: str, model_preset: str) -> tuple[str, str]:
     """品質タグ付きの完全なプロンプトとネガティブプロンプトを構築する。"""
-    # 品質プレフィックス（モデル別）
-    if model == "pony":
-        quality = "score_9, score_8_up, score_7_up, score_6_up"
-    else:
-        quality = QUALITY_PREFIX
-
-    # タグの前後空白を正規化
+    # タグを正規化（余分な空白除去）
     tags = ", ".join(t.strip() for t in raw_tags.split(",") if t.strip())
 
-    full_prompt = f"{quality}, {tags}"
-
-    # ネガティブプロンプト選択
-    if model in MODEL_NEGATIVE_OVERRIDES:
-        negative = MODEL_NEGATIVE_OVERRIDES[model]
-    elif style == "realistic":
+    # モデル別の品質プレフィックスとネガティブプロンプト
+    if model_preset == "pony":
+        quality = QUALITY_PREFIX_PONY
+        negative = NEGATIVE_PROMPT_PONY
+    elif model_preset == "realistic" or (model_preset == "auto" and style == "realistic"):
+        quality = QUALITY_PREFIX_DEFAULT
         negative = NEGATIVE_PROMPT_REALISTIC
     else:
+        quality = QUALITY_PREFIX_DEFAULT
         negative = NEGATIVE_PROMPT_ANIME
 
+    full_prompt = f"{quality}, {tags}"
     return full_prompt, negative
 
 
 # ============================================================
-# 出力
+# 結果表示
 # ============================================================
 
-
-def display_result(prompt: str, negative: str, copied: bool) -> None:
+def display_result(
+    prompt: str,
+    negative: str,
+    style: str,
+    copied: bool,
+    image_path: str,
+) -> None:
     """結果をコンソールに表示する。"""
-    separator = "─" * 60
+    sep = "─" * 60
+    style_label = "🖼️  Anime / Illustration" if style == "anime" else "📷 Realistic / Photo"
 
-    print(separator)
+    print(sep)
+    print(f"  解析画像 : {Path(image_path).name}")
+    print(f"  検出画風 : {style_label}")
+    print(sep)
     print()
     print("[🎨 Stable Diffusion Prompt]")
     print(prompt)
@@ -278,66 +294,81 @@ def display_result(prompt: str, negative: str, copied: bool) -> None:
 
     if copied:
         print("✅ Prompt copied to clipboard!")
+    elif not CLIPBOARD_AVAILABLE:
+        print("💡 pyperclip をインストールすると自動コピーが使えます:")
+        print("   pip install pyperclip")
     else:
-        print("⚠️  クリップボードへのコピーはスキップされました。")
-        if not CLIPBOARD_AVAILABLE:
-            print("   pyperclip をインストールすると自動コピーが有効になります:")
-            print("   pip install pyperclip")
+        print("⚠️  クリップボードへのコピーをスキップしました。")
 
     print()
-    print(separator)
+    print(sep)
 
 
 # ============================================================
-# メイン
+# コマンドライン引数
 # ============================================================
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="SD Vision Pro - 画像解析からStable Diffusionプロンプトを生成",
+        prog="sd_vision_pro.py",
+        description="SD Vision Pro - 画像を解析してStable Diffusionプロンプトを生成（無料）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 使用例:
   python sd_vision_pro.py photo.jpg
   python sd_vision_pro.py anime.png --model pony
-  python sd_vision_pro.py image.webp --no-clipboard
+  python sd_vision_pro.py image.webp --model realistic --no-clipboard
 
-対応画像形式: PNG, JPG, JPEG, GIF, WEBP
+モデルプリセット:
+  auto      ... 画像の画風を自動判定（デフォルト）
+  sdxl      ... Stable Diffusion XL
+  sd15      ... Stable Diffusion 1.5
+  pony      ... Pony Diffusion V6 XL（score_9ベース）
+  realistic ... 実写系モデル（Realistic Visionなど）
 
-環境変数:
-  ANTHROPIC_API_KEY  Claude APIキーを設定してください
+APIキー取得（無料・クレジットカード不要）:
+  https://aistudio.google.com/
+
+無料枠: 1日1,500リクエスト / 1分15リクエスト
 """,
     )
     parser.add_argument(
         "image",
-        help="解析する画像ファイルのパス",
+        help="解析する画像ファイルのパス (PNG/JPG/WEBP/GIF/BMP)",
     )
     parser.add_argument(
         "--model",
-        choices=["sdxl", "sd15", "pony", "realistic"],
-        default="sdxl",
-        help="ターゲットSDモデル (default: sdxl)",
+        choices=["auto", "sdxl", "sd15", "pony", "realistic"],
+        default="auto",
+        metavar="MODEL",
+        help="ターゲットSDモデルプリセット (default: auto)",
     )
     parser.add_argument(
         "--no-clipboard",
         action="store_true",
-        help="クリップボードへのコピーを無効化",
+        help="クリップボードへの自動コピーを無効化",
     )
     return parser.parse_args()
 
 
+# ============================================================
+# エントリーポイント
+# ============================================================
+
 def main() -> None:
     args = parse_args()
 
-    # 画像読み込み
-    image_data, media_type = load_image_as_base64(args.image)
+    # APIキー設定
+    setup_gemini()
 
-    # Claude Vision APIで解析
-    style, raw_tags = analyze_image(image_data, media_type)
+    # 画像読み込み
+    img = load_image(args.image)
+
+    # Geminiで解析
+    style, raw_tags = analyze_image(img)
 
     # プロンプト構築
-    full_prompt, negative = build_full_prompt(style, raw_tags, args.model)
+    full_prompt, negative = build_prompt(style, raw_tags, args.model)
 
     # クリップボードにコピー
     copied = False
@@ -345,11 +376,11 @@ def main() -> None:
         try:
             pyperclip.copy(full_prompt)
             copied = True
-        except pyperclip.PyperclipException:
+        except Exception:
             pass
 
     # 結果表示
-    display_result(full_prompt, negative, copied)
+    display_result(full_prompt, negative, style, copied, args.image)
 
 
 if __name__ == "__main__":
